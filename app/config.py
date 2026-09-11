@@ -245,10 +245,10 @@ CLINIC_API_DRY_RUN = _b("CLINIC_API_DRY_RUN", False)
 
 @dataclass(frozen=True)
 class Doctor:
-    name: str = _s("DOCTOR_NAME", "Dr. Rupinder Singh")
-    speciality: str = _s("DOCTOR_SPECIALITY", "General Medicine")
+    name: str = _s("DOCTOR_NAME", "Dr. Vikash Sharma")
+    speciality: str = _s("DOCTOR_SPECIALITY", "Physiotherapist at Neuranta")
     address: str = _s(
-        "CLINIC_ADDRESS", "Capital Hospital, Jagadhri Ambala Road, Yamunanagar"
+        "CLINIC_ADDRESS", "Neuranta — Neuro & Pediatric Rehabilitation Centre in Gurgaon, Haryana"
     )
     morning: str = _s("OPD_MORNING", "सुबह नौ बजे से दोपहर दो बजे तक")
     evening: str = _s("OPD_EVENING", "शाम तीन बजे से शाम पाँच बजे तक")
