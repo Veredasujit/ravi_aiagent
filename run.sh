@@ -7,7 +7,7 @@ set -euo pipefail
 #   ./run.sh tail       follow the log
 #   ./run.sh call +91…  place an outbound call
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-8810}"
 
 case "${1:-serve}" in
   test)
