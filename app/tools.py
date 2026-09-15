@@ -1,18 +1,32 @@
 """
-tools.py — the two functions the LLM can call.
+tools.py — the functions the LLM can call.
 
-`create_data`  books the appointment against the clinic API.
-`end_call`     ends the call after the farewell has been spoken.
+`create_data`            books the appointment against the clinic API.
+`end_call`               ends the call after the farewell has been spoken.
+`set_caller_phone`       records the caller's phone number when stated verbally.
+`mark_not_booked`        records that the caller declined to book.
 
-Both are fully logged: arguments in, HTTP status and body out, wall time.
+All are fully logged: arguments in, HTTP status and body out, wall time.
 If the clinic API is unreachable the tool returns a structured failure rather
 than raising, so Ravi can apologise in Hindi instead of the call going silent.
+
+BOOKING → WHATSAPP WIRING
+─────────────────────────
+The session owns the booking state (`booking_registry` keyed by call_id).
+ToolRunner reaches back into the session via `self._session` (bound in
+`CallSession.__init__`). When `create_data` succeeds, it calls
+`session.on_booking_confirmed(...)` so the session records it.
+
+The actual WhatsApp message is NOT sent here. It is enqueued by `/webhook`
+when Teler reports the call as `completed` — the only reliable "call is
+really over" signal.
 """
 
 from __future__ import annotations
 
 import re
 import time
+import uuid
 from typing import Any, Optional
 
 import aiohttp
@@ -20,6 +34,9 @@ import aiohttp
 from . import config
 from .logging_setup import CallLog, error, info, log, warn
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Tool schema exposed to the LLM
+# ═══════════════════════════════════════════════════════════════════════════
 TOOLS_SCHEMA: list[dict] = [
     {
         "type": "function",
@@ -61,6 +78,57 @@ TOOLS_SCHEMA: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "set_caller_phone",
+            "description": (
+                "Record the caller's phone number when they state it verbally. "
+                "Call this as soon as a 10-digit number is clearly heard. "
+                "Do NOT call this for numbers the caller only mentions in "
+                "passing (e.g. a relative's number)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": (
+                            "The 10-digit Indian mobile number, digits only. "
+                            "Strip spaces, dashes and country code."
+                        ),
+                    }
+                },
+                "required": ["phone_number"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_not_booked",
+            "description": (
+                "Call this if the caller clearly will NOT book an appointment "
+                "on this call (just asking for info, will visit in person, "
+                "wrong number, etc.). Say the closing line in the same turn."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Short reason: 'only_enquiry', 'wrong_number', "
+                            "'will_visit', 'not_interested', 'emergency_redirect'."
+                        ),
+                    }
+                },
+                "required": ["reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "end_call",
             "description": (
                 "End the phone call. Say the farewell line in the same turn "
@@ -84,6 +152,10 @@ TOOLS_SCHEMA: list[dict] = [
     },
 ]
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Duration normalisation
+# ═══════════════════════════════════════════════════════════════════════════
 _HINDI_NUMBERS = {
     "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6,
     "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10, "पंद्रह": 15, "बीस": 20,
@@ -123,43 +195,71 @@ def normalise_days(raw: str) -> tuple[str, Optional[int]]:
     return s, n
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ToolRunner
+# ═══════════════════════════════════════════════════════════════════════════
 class ToolRunner:
     """Executes tool calls for one call. Holds the HTTP session."""
 
     def __init__(self, call_log: CallLog, call_id: str) -> None:
         self.call_log = call_log
         self.call_id = call_id
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._http: Optional[aiohttp.ClientSession] = None
         self.hangup_requested = False
         self.hangup_reason = ""
         self.booking: Optional[dict] = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
+        # Bound by CallSession.__init__ via bind_session(). Optional — if
+        # it's None, tools still work but won't trigger WhatsApp follow-ups.
+        self._session = None
+
+    # ── session binding ─────────────────────────────────────────────────
+    def bind_session(self, session) -> None:
+        """
+        Called by CallSession.__init__ so the tool handlers can reach back
+        into the session (booking confirmation, phone capture, etc.).
+        """
+        self._session = session
+        info("tool", f"ToolRunner bound to session call_id={self.call_id}")
+
+    # ── HTTP plumbing ──────────────────────────────────────────────────
+    async def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=config.CLINIC_API_TIMEOUT_S)
             )
-        return self._session
+        return self._http
 
+    # ── dispatcher ─────────────────────────────────────────────────────
     async def run(self, name: str, args: dict[str, Any]) -> dict:
         t0 = time.monotonic()
         self.call_log.event("tool_call", tool=name, arguments=args)
         info("tool", f"{name}({args})")
 
-        if name == "create_data":
-            result = await self._create_data(args)
-        elif name == "end_call":
-            result = self._end_call(args)
-        else:
-            warn("tool", f"unknown tool: {name}")
-            result = {"success": False, "error": f"unknown tool {name}"}
+        try:
+            if name == "create_data":
+                result = await self._create_data(args)
+            elif name == "end_call":
+                result = self._end_call(args)
+            elif name == "set_caller_phone":
+                result = self._set_caller_phone(args)
+            elif name == "mark_not_booked":
+                result = self._mark_not_booked(args)
+            else:
+                warn("tool", f"unknown tool: {name}")
+                result = {"success": False, "error": f"unknown tool {name}"}
+        except Exception as exc:
+            error("tool", f"{name} raised: {exc}")
+            result = {"success": False, "error": str(exc)}
 
         ms = round((time.monotonic() - t0) * 1000, 1)
         self.call_log.event("tool_result", tool=name, ms=ms, result=result)
         info("tool", f"{name} -> {result} ({ms} ms)")
         return result
 
-    # ── create_data ─────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # create_data — book appointment
+    # ═══════════════════════════════════════════════════════════════════
     async def _create_data(self, args: dict[str, Any]) -> dict:
         name = str(args.get("name") or "").strip()
         symptom = str(args.get("symptom") or "").strip()
@@ -199,9 +299,11 @@ class ToolRunner:
             "preferred_time": slot,
             "source": "voice_agent",
             "call_id": self.call_id,
+            "phone_number": self._caller_phone() or None,
             "status": "pending",
         }
 
+        # ─── Dry-run / no-key path ─────────────────────────────────────
         if config.CLINIC_API_DRY_RUN or not config.CLINIC_API_KEY:
             reason = (
                 "CLINIC_API_DRY_RUN is on"
@@ -209,12 +311,24 @@ class ToolRunner:
                 else "clinic API key not configured"
             )
             warn("tool", f"booking NOT persisted — {reason}")
-            self.booking = payload
+            appointment_id = f"local_{int(time.time())}"
+            self.booking = {**payload, "appointment_id": appointment_id}
+
+            # Notify the session so the booking registry is populated and
+            # WhatsApp will fire when the call ends.
+            self._notify_booking_confirmed(
+                name=name,
+                symptom=symptom,
+                days_text=days_text,
+                slot=slot,
+                appointment_id=appointment_id,
+            )
+
             return {
                 "success": True,
                 "persisted": False,
                 "note": reason,
-                "appointment_id": f"local_{int(time.time())}",
+                "appointment_id": appointment_id,
                 "doctor": config.DOCTOR.name,
                 "address": config.DOCTOR.address,
                 "slot": slot,
@@ -223,6 +337,7 @@ class ToolRunner:
                 ),
             }
 
+        # ─── Real API call ────────────────────────────────────────────
         headers = {
             "Content-Type": "application/json",
             "X-Api-Key": config.CLINIC_API_KEY,
@@ -232,22 +347,36 @@ class ToolRunner:
 
         url = f"{config.CLINIC_API_BASE}/appointments"
         try:
-            session = await self._get_session()
+            session = await self._get_http()
             async with session.post(url, json=payload, headers=headers) as resp:
                 body = await resp.text()
                 log("tool", f"POST {url} -> {resp.status} {body[:400]}")
+
                 if 200 <= resp.status < 300:
                     try:
                         data = await resp.json(content_type=None)
                     except Exception:
                         data = {}
-                    self.booking = payload
+                    appointment_id = (
+                        (data or {}).get("id")
+                        or (data or {}).get("appointment_id")
+                        or f"apt_{int(time.time())}"
+                    )
+                    self.booking = {**payload, "appointment_id": appointment_id}
+
+                    # Notify the session.
+                    self._notify_booking_confirmed(
+                        name=name,
+                        symptom=symptom,
+                        days_text=days_text,
+                        slot=slot,
+                        appointment_id=appointment_id,
+                    )
+
                     return {
                         "success": True,
                         "persisted": True,
-                        "appointment_id": (data or {}).get("id")
-                        or (data or {}).get("appointment_id")
-                        or f"apt_{int(time.time())}",
+                        "appointment_id": appointment_id,
                         "doctor": config.DOCTOR.name,
                         "address": config.DOCTOR.address,
                         "slot": slot,
@@ -257,6 +386,7 @@ class ToolRunner:
                             else config.DOCTOR.evening
                         ),
                     }
+
                 error("tool", f"clinic API {resp.status}: {body[:300]}")
                 return {
                     "success": False,
@@ -277,12 +407,118 @@ class ToolRunner:
                 ),
             }
 
-    # ── end_call ────────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # set_caller_phone — LLM states the number verbally
+    # ═══════════════════════════════════════════════════════════════════
+    def _set_caller_phone(self, args: dict[str, Any]) -> dict:
+        raw = str(args.get("phone_number") or "").strip()
+        if not raw:
+            return {"success": False, "error": "empty_phone"}
+
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        # Strip leading 91 / 0 if the caller included country code.
+        if len(digits) == 12 and digits.startswith("91"):
+            digits = digits[2:]
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = digits[1:]
+
+        if len(digits) != 10:
+            warn("tool", f"phone_number not 10 digits after cleanup: {raw!r} -> {digits!r}")
+            return {
+                "success": False,
+                "error": "invalid_phone",
+                "digits": digits,
+                "say": "क्या आप नंबर दोबारा बता सकते हैं? दस अंकों का।",
+            }
+
+        if self._session is not None:
+            try:
+                self._session.set_phone_number(digits)
+            except Exception as exc:
+                warn("tool", f"session.set_phone_number failed: {exc}")
+        return {"success": True, "phone_number": digits}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # mark_not_booked — caller declined
+    # ═══════════════════════════════════════════════════════════════════
+    def _mark_not_booked(self, args: dict[str, Any]) -> dict:
+        reason = str(args.get("reason") or "unspecified")
+        if self._session is not None:
+            try:
+                self._session.on_no_booking(reason=reason)
+            except Exception as exc:
+                warn("tool", f"session.on_no_booking failed: {exc}")
+        else:
+            self.booking = {"status": "not_booked", "reason": reason}
+        return {"success": True, "status": "not_booked", "reason": reason}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # end_call
+    # ═══════════════════════════════════════════════════════════════════
     def _end_call(self, args: dict[str, Any]) -> dict:
         self.hangup_requested = True
         self.hangup_reason = str(args.get("reason") or "unspecified")
+
+        # If the call ends and no booking was recorded, treat as not-booked.
+        # This ensures the follow-up WhatsApp goes out even if the LLM
+        # forgot to call mark_not_booked.
+        if (
+            self._session is not None
+            and getattr(self._session, "booking_record", None) is None
+        ):
+            try:
+                self._session.on_no_booking(reason=f"end_call:{self.hangup_reason}")
+            except Exception as exc:
+                warn("tool", f"session.on_no_booking on end_call failed: {exc}")
+
         return {"success": True, "message": "Call will end after this reply."}
 
+    # ═══════════════════════════════════════════════════════════════════
+    # helpers
+    # ═══════════════════════════════════════════════════════════════════
+    def _caller_phone(self) -> str:
+        """Best-known caller number so far (empty string if unknown)."""
+        if self._session is not None:
+            return getattr(self._session, "phone_number", "") or ""
+        return ""
+
+    def _notify_booking_confirmed(
+        self,
+        *,
+        name: str,
+        symptom: str,
+        days_text: str,
+        slot: str,
+        appointment_id: str,
+    ) -> None:
+        """
+        Push the confirmed booking into the session's booking registry.
+        The actual WhatsApp message is deferred to /webhook `completed`.
+        """
+        if self._session is None:
+            warn("tool", "no session bound — booking will not trigger WhatsApp")
+            return
+        try:
+            self._session.on_booking_confirmed(
+                patient_name=name,
+                department=config.DOCTOR.department if hasattr(config.DOCTOR, "department") else None,
+                doctor=config.DOCTOR.name,
+                appointment_time=(
+                    config.DOCTOR.morning if slot == "morning" else config.DOCTOR.evening
+                ),
+                booking_id=appointment_id,
+                extra={
+                    "symptom": symptom,
+                    "duration_text": days_text,
+                    "preferred_slot": slot,
+                },
+            )
+        except Exception as exc:
+            error("tool", f"session.on_booking_confirmed failed: {exc}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # cleanup
+    # ═══════════════════════════════════════════════════════════════════
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        if self._http and not self._http.closed:
+            await self._http.close()

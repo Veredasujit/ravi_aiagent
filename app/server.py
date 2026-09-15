@@ -1,11 +1,12 @@
 """
 server.py — the HTTP/WebSocket surface Teler talks to.
 
-    POST /flow            Teler asks "what should this call do?" -> stream flow
-    POST /webhook         call lifecycle events (ringing, answered, completed)
-    WS   /media-stream    the actual audio, bidirectional
-    POST /call/outbound   you trigger an outbound call
-    GET  /health          readiness + config sanity
+POST /flow            Teler asks "what should this call do?" -> stream flow
+POST /webhook         call lifecycle events (ringing, answered, completed)
+WS   /media-stream    the actual audio, bidirectional
+POST /call/outbound   you trigger an outbound call
+GET  /health          readiness + config sanity
+GET  /queue/stats     message queue observability
 
 Inbound and outbound use the *same* flow and the same media-stream handler.
 The only difference is who dialled: for outbound we call Teler's initiate
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import config
+from .booking_state import BookingStatus, booking_registry
 from .logging_setup import (
     error,
     info,
@@ -34,15 +36,16 @@ from .logging_setup import (
     setup_logging,
     warn,
 )
+from .messaging_service import messaging_service
 from .session import CallSession
 
 setup_logging()
 
-app = FastAPI(title="Ravi — Capital Hospital voice agent", version="1.0.0")
+app = FastAPI(title="Ravi — Capital Hospital voice agent", version="1.1.0")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# startup checks — fail loudly at boot, not mid-call
+# startup / shutdown
 # ═══════════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def _startup() -> None:
@@ -57,18 +60,31 @@ async def _startup() -> None:
             else f"tts=sarvam:{config.SARVAM_MODEL}/{config.SARVAM_VOICE}"
             f"@{config.SARVAM_SAMPLE_RATE} "
         )
-        + 
-        f"llm={config.OPENAI_MODEL}",
+        + f"llm={config.OPENAI_MODEL}",
     )
     missing = config.missing_required()
     if missing:
         warn("boot", f"MISSING ENV: {', '.join(missing)} — calls will fail")
     else:
         info("boot", "all required env vars present")
+
     if config.VAD_ENABLED:
         from .vad import _get_model
 
         _get_model()  # load Silero now so the first call isn't slowed by it
+
+    # Start WhatsApp message queue workers
+    await messaging_service.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    info("boot", "shutting down…")
+    await messaging_service.stop()
+    # Best-effort: flush stale booking records (>24h)
+    removed = booking_registry.cleanup_older_than(24 * 3600)
+    if removed:
+        info("boot", f"cleaned {removed} stale booking records")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -78,8 +94,6 @@ def _stream_flow() -> dict:
     return {
         "action": "stream",
         "ws_url": f"wss://{config.PUBLIC_HOST}/media-stream",
-        # FreJun's reference bridge declares this; leaving it out lets Teler
-        # choose a default that may not match the audio we send back.
         "sample_rate": config.TELER_STREAM_SAMPLE_RATE,
         "chunk_size": config.TELER_CHUNK_SIZE,
         "record": config.TELER_RECORD,
@@ -88,10 +102,6 @@ def _stream_flow() -> dict:
 
 @app.post("/flow")
 async def flow(payload: dict = Body(default={})) -> JSONResponse:
-    """
-    Teler fetches this when a call needs instructions — inbound and outbound.
-    Returning the stream action hands the audio to /media-stream.
-    """
     info("flow", f"flow requested: {json.dumps(payload, ensure_ascii=False)[:300]}")
     if not config.PUBLIC_HOST:
         error("flow", "PUBLIC_HOST is not set — Teler cannot reach the websocket")
@@ -102,7 +112,7 @@ async def flow(payload: dict = Body(default={})) -> JSONResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Teler status webhook
+# Teler status webhook — the *reliable* "call completed" trigger
 # ═══════════════════════════════════════════════════════════════════════════
 def _verify_signature(body: bytes, signature: Optional[str]) -> bool:
     if config.SKIP_SIGNATURE_VERIFICATION:
@@ -118,6 +128,59 @@ def _verify_signature(body: bytes, signature: Optional[str]) -> bool:
     return hmac.compare_digest(expected, signature.strip().lower())
 
 
+def _extract_call_id(data: dict) -> Optional[str]:
+    for key in ("call_id", "callId", "call_sid", "CallSid", "id", "uuid"):
+        v = data.get(key)
+        if v:
+            return str(v)
+    nested = data.get("data") or data.get("call") or {}
+    if isinstance(nested, dict):
+        for key in ("call_id", "callId", "call_sid", "id"):
+            v = nested.get(key)
+            if v:
+                return str(v)
+    return None
+
+
+def _extract_status(data: dict) -> Optional[str]:
+    for key in ("status", "event", "type", "call_status"):
+        v = data.get(key)
+        if v:
+            return str(v).lower()
+    nested = data.get("data") or data.get("call") or {}
+    if isinstance(nested, dict):
+        for key in ("status", "event", "type"):
+            v = nested.get(key)
+            if v:
+                return str(v).lower()
+    return None
+
+
+def _extract_phone(data: dict) -> Optional[str]:
+    for key in ("to_number", "to", "caller", "customer_number", "phone"):
+        v = data.get(key)
+        if v:
+            return str(v)
+    nested = data.get("data") or data.get("call") or {}
+    if isinstance(nested, dict):
+        for key in ("to_number", "to", "caller", "phone"):
+            v = nested.get(key)
+            if v:
+                return str(v)
+    return None
+
+
+COMPLETED_EVENTS = {
+    "completed",
+    "call.completed",
+    "call_completed",
+    "hangup",
+    "call.ended",
+    "ended",
+    "call_end",
+}
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -125,17 +188,39 @@ async def webhook(
     x_signature: Optional[str] = Header(default=None, alias="X-Signature"),
 ) -> JSONResponse:
     body = await request.body()
-    # FreJun sends X-Teler-Signature. X-Signature is accepted as a fallback in
-    # case the header name differs across webhook versions.
     signature = x_teler_signature or x_signature
     if not _verify_signature(body, signature):
         warn("webhook", "signature verification failed")
         raise HTTPException(401, "invalid signature")
+
     try:
         data: Any = json.loads(body or b"{}")
     except ValueError:
         data = {"raw": body.decode("utf-8", "ignore")}
+
     info("webhook", json.dumps(data, ensure_ascii=False)[:600])
+
+    if isinstance(data, dict):
+        event = _extract_status(data)
+        call_id = _extract_call_id(data)
+        phone = _extract_phone(data)
+
+        if event in COMPLETED_EVENTS:
+            if not call_id:
+                warn("webhook", "completed event with no call_id — cannot dispatch")
+            else:
+                # Make sure we have a phone number on record
+                rec = booking_registry.get(call_id)
+                if rec and phone and not rec.phone_number:
+                    rec.phone_number = phone
+
+                # Decide + enqueue the appropriate WhatsApp message
+                asyncio_ok = await messaging_service.enqueue_for_completed_call(
+                    call_id, phone_number=phone
+                )
+                if asyncio_ok:
+                    info("webhook", f"queued WhatsApp for call {call_id}")
+
     return JSONResponse({"received": True})
 
 
@@ -174,10 +259,6 @@ class OutboundRequest(BaseModel):
 
 @app.post("/call/outbound")
 async def call_outbound(req: OutboundRequest) -> JSONResponse:
-    """
-    Dial a number. Teler then fetches /flow and connects /media-stream, so the
-    agent behaves identically to an inbound call.
-    """
     if not config.TELER_API_KEY:
         raise HTTPException(500, "TELER_API_KEY not configured")
     if not config.PUBLIC_HOST:
@@ -222,7 +303,7 @@ async def call_outbound(req: OutboundRequest) -> JSONResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# health
+# health + observability
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 async def health() -> JSONResponse:
@@ -266,8 +347,19 @@ async def health() -> JSONResponse:
                 "barge_in": config.BARGE_IN_ENABLED,
                 "barge_in_requires_asr": config.BARGE_IN_REQUIRE_ASR,
             },
+            "whatsapp": {
+                "enabled": config.WHATSAPP_ENABLED,
+                "api_url": config.WHATSAPP_API_URL,
+                "api_key_set": bool(config.WHATSAPP_API_KEY),
+            },
+            "queue": messaging_service.stats(),
         }
     )
+
+
+@app.get("/queue/stats")
+async def queue_stats() -> JSONResponse:
+    return JSONResponse(messaging_service.stats())
 
 
 @app.get("/")
