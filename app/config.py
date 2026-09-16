@@ -72,7 +72,7 @@ SKIP_SIGNATURE_VERIFICATION = _b("SKIP_SIGNATURE_VERIFICATION", False)
 # sends no Origin header, so it is unaffected by this list.
 CORS_ORIGINS = _list(
     "CORS_ORIGINS",
-    "https://vedronix.com,https://www.vedronix.com,http://localhost:5173",
+    "https://vedronix.com,https://www.vedronix.com,http://localhost:5173,http://localhost:3000",
 )
 
 # Guards on the public outbound endpoint. Every request spends real money, and
