@@ -242,6 +242,24 @@ CLINIC_API_SECRET = _s("CLINIC_001_API_SECRET") or _s("APPOINTMENT_API_SECRET")
 CLINIC_API_TIMEOUT_S = _f("CLINIC_API_TIMEOUT_S", 6.0)
 CLINIC_API_DRY_RUN = _b("CLINIC_API_DRY_RUN", False)
 
+# WhatsApp
+WHATSAPP_API_KEY = os.getenv("WHATSAPP_API_KEY", "")
+WHATSAPP_API_URL = os.getenv(
+    "WHATSAPP_API_URL",
+    "https://whatsappev.vedronix.com/api/v1/messages/text",
+)
+WHATSAPP_ENABLED = os.getenv("WHATSAPP_ENABLED", "true").lower() == "true"
+WHATSAPP_DEFAULT_COUNTRY_CODE = os.getenv("WHATSAPP_DEFAULT_COUNTRY_CODE", "91")
+
+# Queue
+QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "10000"))
+QUEUE_WORKERS = int(os.getenv("QUEUE_WORKERS", "3"))
+QUEUE_MAX_RETRIES = int(os.getenv("QUEUE_MAX_RETRIES", "3"))
+QUEUE_RETRY_BACKOFF = float(os.getenv("QUEUE_RETRY_BACKOFF", "2.0"))
+# config.py
+DEBUG_ENDPOINTS_ENABLED = os.getenv(
+    "DEBUG_ENDPOINTS_ENABLED", "true"
+).lower() == "true"
 
 @dataclass(frozen=True)
 class Doctor:

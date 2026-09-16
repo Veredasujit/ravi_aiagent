@@ -56,6 +56,7 @@ import time
 from typing import Optional
 
 from . import config
+from . import flow_metadata
 from .audio import EndianDetector
 from .booking_state import BookingStatus, booking_registry
 from .llm import LLMClient, speakable
@@ -224,7 +225,6 @@ class CallSession:
         dur = round(time.monotonic() - self._started_at, 1)
         info("call", f"session end after {dur}s")
 
-        # Final booking snapshot for the log.
         booking_snapshot = None
         if self.booking_record is not None:
             booking_snapshot = self.booking_record.to_dict()
@@ -254,9 +254,8 @@ class CallSession:
         )
         self.call_log.close()
 
-        # IMPORTANT: do NOT send WhatsApp here. The /webhook `completed`
+        # IMPORTANT: do NOT enqueue WhatsApp here. The /webhook `completed`
         # event is the only reliable signal that the call is actually over.
-        # If we fire here, we may race with the carrier or double-send.
 
     # ════════════════════════════════════════════════════════════════════════
     # inbound audio from Teler
@@ -304,10 +303,20 @@ class CallSession:
         self.call_log.event("stream_start", teler_call_id=remote_id, detail=data)
         self._stream_ready.set()
 
-        # ─── Extract phone number from the start payload ───────────────
-        # Teler/Twilio-style start frames usually include `to` / `from` /
-        # `caller`. We want the CUSTOMER's number (the `from` for inbound,
-        # the `to` for outbound). Try several keys.
+        # ─── ADOPT Teler's call_id so webhooks and sessions agree ──────
+        if remote_id and remote_id != self.call_id:
+            old_id = self.call_id
+            self.call_id = str(remote_id)
+            set_call_id(self.call_id)
+            info("call", f"adopted teler call_id {old_id!r} -> {self.call_id!r}")
+
+            # Re-key the booking registry entry under the new ID.
+            if self.booking_record is not None:
+                booking_registry.rekey(old_id, self.call_id)
+                self.booking_record.call_id = self.call_id
+
+        # ─── Extract phone number, in order of priority ────────────────
+        # 1. Try the start frame itself
         candidate = (
             data.get("from")
             or data.get("caller")
@@ -316,8 +325,32 @@ class CallSession:
             or data.get("to")
             or data.get("to_number")
         )
+
+        # 2. Fall back to /flow metadata (Teler sends from/to when we fetch flow)
+        if not candidate:
+            try:
+                meta = flow_metadata.pop(self.call_id)
+                if meta:
+                    direction = (meta.get("direction") or "inbound").lower()
+                    if direction == "outbound":
+                        candidate = meta.get("to_number") or meta.get("from_number")
+                    else:
+                        # inbound: caller is `from`
+                        candidate = meta.get("from_number") or meta.get("to_number")
+                    if candidate:
+                        info(
+                            "call",
+                            f"phone from /flow metadata: {candidate} "
+                            f"(direction={direction})",
+                        )
+            except Exception as exc:
+                warn("call", f"could not read /flow metadata: {exc}")
+
         if candidate:
             self.set_phone_number(str(candidate))
+            info("call", f"phone set to {self.phone_number!r}")
+        else:
+            warn("call", "no phone number available from start frame or /flow metadata")
 
     def set_phone_number(self, number: str) -> None:
         """
@@ -795,7 +828,6 @@ class CallSession:
                 if now - self._started_at > config.MAX_CALL_SECONDS:
                     warn("call", "max call duration reached")
                     self.call_log.event("max_duration_reached")
-                    # If a booking was already confirmed, leave it as confirmed.
                     if self.booking_record and self.booking_record.status == BookingStatus.CONFIRMED:
                         pass
                     else:

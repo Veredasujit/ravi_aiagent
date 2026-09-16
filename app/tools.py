@@ -20,6 +20,13 @@ ToolRunner reaches back into the session via `self._session` (bound in
 The actual WhatsApp message is NOT sent here. It is enqueued by `/webhook`
 when Teler reports the call as `completed` — the only reliable "call is
 really over" signal.
+
+ASCII-SAFE BOOKING DATA
+───────────────────────
+Vedronix's upstream (Evolution API) rejects non-ASCII characters in the
+WhatsApp `text` field. So the booking confirmation stores an English
+`symptom_en` alongside the original Hindi `symptom`, and the appointment
+time is emitted as "9 AM to 2 PM" rather than "सुबह नौ बजे...".
 """
 
 from __future__ import annotations
@@ -154,13 +161,67 @@ TOOLS_SCHEMA: list[dict] = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Duration normalisation
+# Hindi → English helpers (for WhatsApp-safe text)
 # ═══════════════════════════════════════════════════════════════════════════
 _HINDI_NUMBERS = {
     "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6,
     "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10, "पंद्रह": 15, "बीस": 20,
     "एक्": 1,
 }
+
+# Common symptoms — extend this as you see more calls
+_SYMPTOM_MAP = {
+    "दिल में दर्द": "chest pain",
+    "दिल मे दर्द": "chest pain",
+    "सीने में दर्द": "chest pain",
+    "कमर दर्द": "back pain",
+    "कमर में दर्द": "back pain",
+    "पीठ दर्द": "back pain",
+    "सिर दर्द": "headache",
+    "सर दर्द": "headache",
+    "पेट दर्द": "stomach pain",
+    "पेट में दर्द": "stomach pain",
+    "बुखार": "fever",
+    "खांसी": "cough",
+    "खाँसी": "cough",
+    "जुकाम": "cold",
+    "जुक़ाम": "cold",
+    "घुटने में दर्द": "knee pain",
+    "जोड़ों में दर्द": "joint pain",
+    "थकान": "fatigue",
+    "चक्कर": "dizziness",
+    "उल्टी": "vomiting",
+    "दस्त": "diarrhea",
+    "कब्ज": "constipation",
+    "सांस": "breathing difficulty",
+    "साँस": "breathing difficulty",
+}
+
+
+def _ascii_safe_patient_text(text: str) -> str:
+    """
+    Best-effort Hindi → English for WhatsApp-safe text.
+    1. Try known symptom phrase mapping.
+    2. Otherwise strip non-ASCII.
+    Never returns empty — falls back to 'symptom'.
+    """
+    if not text:
+        return "symptom"
+    s = text.strip()
+
+    # Direct phrase match
+    for hindi, english in _SYMPTOM_MAP.items():
+        if hindi in s:
+            return english
+
+    # Word-level fallback
+    for hindi, english in _SYMPTOM_MAP.items():
+        if any(part in s for part in hindi.split()):
+            return english
+
+    # Last resort — strip non-ASCII
+    cleaned = s.encode("ascii", "ignore").decode("ascii").strip()
+    return cleaned or "symptom"
 
 
 def normalise_days(raw: str) -> tuple[str, Optional[int]]:
@@ -193,6 +254,27 @@ def normalise_days(raw: str) -> tuple[str, Optional[int]]:
     elif "साल" in s or "year" in low or "वर्ष" in s:
         n *= 365
     return s, n
+
+
+def _english_duration(days_text: str, days_num: Optional[int]) -> str:
+    """Produce an ASCII-only duration string for WhatsApp."""
+    if days_num:
+        if days_num == 1:
+            return "1 day"
+        if days_num < 7:
+            return f"{days_num} days"
+        if days_num < 30:
+            weeks = max(1, days_num // 7)
+            return f"{weeks} week{'s' if weeks > 1 else ''}"
+        if days_num < 365:
+            months = max(1, days_num // 30)
+            return f"{months} month{'s' if months > 1 else ''}"
+        years = max(1, days_num // 365)
+        return f"{years} year{'s' if years > 1 else ''}"
+
+    # Fall back to whatever the LLM gave, stripped of non-ASCII
+    cleaned = (days_text or "").encode("ascii", "ignore").decode("ascii").strip()
+    return cleaned or "unspecified"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -320,6 +402,7 @@ class ToolRunner:
                 name=name,
                 symptom=symptom,
                 days_text=days_text,
+                days_num=days_num,
                 slot=slot,
                 appointment_id=appointment_id,
             )
@@ -369,6 +452,7 @@ class ToolRunner:
                         name=name,
                         symptom=symptom,
                         days_text=days_text,
+                        days_num=days_num,
                         slot=slot,
                         appointment_id=appointment_id,
                     )
@@ -488,28 +572,53 @@ class ToolRunner:
         name: str,
         symptom: str,
         days_text: str,
+        days_num: Optional[int],
         slot: str,
         appointment_id: str,
     ) -> None:
         """
         Push the confirmed booking into the session's booking registry.
-        The actual WhatsApp message is deferred to /webhook `completed`.
+        All strings passed here must be ASCII-safe — the WhatsApp message
+        will use them verbatim, and Vedronix rejects non-ASCII.
+
+        We store the original Hindi alongside the English translation in
+        `extra` so the call log still shows what the caller actually said.
         """
         if self._session is None:
             warn("tool", "no session bound — booking will not trigger WhatsApp")
             return
+
+        # English appointment time
+        appointment_time_en = (
+            "9 AM to 2 PM" if slot == "morning" else "4 PM to 8 PM"
+        )
+
+        # English symptom
+        symptom_en = _ascii_safe_patient_text(symptom)
+
+        # English duration
+        duration_en = _english_duration(days_text, days_num)
+
+        # Full English summary for WhatsApp
+        summary_en = (
+            f"Patient: {name} | Symptom: {symptom_en} | "
+            f"Duration: {duration_en} | Slot: {appointment_time_en}"
+        )
+
         try:
             self._session.on_booking_confirmed(
                 patient_name=name,
-                department=config.DOCTOR.department if hasattr(config.DOCTOR, "department") else None,
                 doctor=config.DOCTOR.name,
-                appointment_time=(
-                    config.DOCTOR.morning if slot == "morning" else config.DOCTOR.evening
-                ),
+                appointment_time=appointment_time_en,
                 booking_id=appointment_id,
                 extra={
-                    "symptom": symptom,
-                    "duration_text": days_text,
+                    # Original (for logs / clinic API)
+                    "symptom_original": symptom,
+                    "duration_original": days_text,
+                    # English (for WhatsApp)
+                    "symptom_en": symptom_en,
+                    "duration_en": duration_en,
+                    "summary_en": summary_en,
                     "preferred_slot": slot,
                 },
             )

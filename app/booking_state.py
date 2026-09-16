@@ -137,6 +137,38 @@ class BookingRegistry:
             for k in stale:
                 self._records.pop(k, None)
         return len(stale)
+    # booking_state.py — inside BookingRegistry class
+
+def rekey(self, old_call_id: str, new_call_id: str) -> Optional[BookingRecord]:
+    """
+    Re-key a booking record when the session adopts Teler's call_id
+    after the initial WebSocket `start` frame.
+    """
+    if not old_call_id or not new_call_id or old_call_id == new_call_id:
+        return self._records.get(new_call_id)
+    with self._lock:
+        rec = self._records.pop(old_call_id, None)
+        if rec is None:
+            return self._records.get(new_call_id)
+        # If a record already existed under the new ID, keep the one
+        # with the more advanced status (confirmed > not_booked > ...).
+        existing = self._records.get(new_call_id)
+        if existing is not None:
+            rank = {
+                BookingStatus.NOT_STARTED: 0,
+                BookingStatus.COLLECTING: 1,
+                BookingStatus.NOT_BOOKED: 2,
+                BookingStatus.CANCELLED: 2,
+                BookingStatus.CONFIRMED: 3,
+            }
+            if rank.get(rec.status, 0) >= rank.get(existing.status, 0):
+                rec.call_id = new_call_id
+                self._records[new_call_id] = rec
+            # else keep existing
+            return self._records[new_call_id]
+        rec.call_id = new_call_id
+        self._records[new_call_id] = rec
+        return rec
 
 
 # module-level singleton
