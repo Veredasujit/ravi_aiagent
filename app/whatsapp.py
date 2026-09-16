@@ -100,38 +100,89 @@ def _ascii_safe(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Clinic branding — pull from config so this stays in one place
+# ---------------------------------------------------------------------------
+def _clinic_name() -> str:
+    return getattr(config, "CLINIC_NAME", None) or "our clinic"
+
+
+def _clinic_short() -> str:
+    """
+    A short clinic name for greetings. If CLINIC_NAME has an em-dash or
+    comma, take only the first chunk.
+    """
+    name = _clinic_name()
+    for sep in (" — ", " - ", ", "):
+        if sep in name:
+            name = name.split(sep, 1)[0].strip()
+            break
+    return name
+
+
+# ---------------------------------------------------------------------------
 # Templates — ASCII-only, no emoji, no non-English text
 # ---------------------------------------------------------------------------
 def render_booking_confirmed(rec: BookingRecord) -> str:
-    parts = ["Thank you for calling Capital Hospital."]
-    parts.append("Your appointment has been successfully booked.")
+    """
+    Rich, multi-line confirmation. Only includes fields that are
+    actually populated (avoids "Patient: " blank lines).
+    """
+    clinic = _clinic_short()
+    lines = [
+        f"Thank you for calling {clinic}.",
+        "",
+        "Your appointment has been successfully booked.",
+        "",
+    ]
     if rec.booking_id:
-        parts.append(f"Booking ID: {rec.booking_id}")
+        lines.append(f"Booking ID: {rec.booking_id}")
     if rec.patient_name:
-        parts.append(f"Patient: {rec.patient_name}")
+        lines.append(f"Patient: {rec.patient_name}")
     if rec.doctor:
-        parts.append(f"Doctor: {rec.doctor}")
+        lines.append(f"Doctor: {rec.doctor}")
     if rec.department:
-        parts.append(f"Department: {rec.department}")
+        lines.append(f"Department: {rec.department}")
     if rec.appointment_time:
-        parts.append(f"When: {rec.appointment_time}")
-    parts.append("Reply here if you need to reschedule.")
-    return "\n".join(parts)
+        lines.append(f"Time: {rec.appointment_time}")
+
+    # Extra fields from the booking tool
+    extra = rec.details or {}
+    if extra.get("symptom_en"):
+        lines.append(f"Concern: {extra['symptom_en']}")
+    if extra.get("duration_en"):
+        lines.append(f"Duration: {extra['duration_en']}")
+
+    lines.append("")
+    lines.append("Please arrive 10 minutes early with a valid ID.")
+    lines.append("Reply here if you need to reschedule.")
+    return "\n".join(lines)
 
 
 def render_followup_no_booking(rec: BookingRecord) -> str:
-    parts = ["Thank you for calling Capital Hospital."]
-    parts.append(
-        "If you would like to book an appointment or need any further help, "
-        "please reply to this message. We will be happy to assist you."
-    )
-    return "\n".join(parts)
+    """
+    Sent when the caller did NOT complete a booking — whether they
+    declined, hung up mid-conversation, or the session never started.
+    """
+    clinic = _clinic_short()
+    lines = [
+        f"Thank you for calling {clinic}.",
+        "",
+        "If you would like to book an appointment or need any further "
+        "help, just reply to this message or call us back.",
+        "",
+        "We will be happy to assist you.",
+    ]
+    return "\n".join(lines)
 
 
 def render_generic_call_ended(rec: BookingRecord) -> str:
+    """
+    Universal fallback used when we're not sure what happened.
+    """
+    clinic = _clinic_short()
     return (
-        "Thank you for calling Capital Hospital. "
-        "If you need anything, just reply to this message."
+        f"Thank you for calling {clinic}. "
+        f"If you need anything, just reply to this message."
     )
 
 
@@ -177,7 +228,6 @@ async def _post_text(number: str, text: str, delay: int = 1500) -> dict:
         "Content-Type": "application/json",
     }
 
-    # Single confirmed working shape: flat text, 12-digit number, no +.
     payload = {"number": norm, "text": text, "delay": delay}
 
     try:
