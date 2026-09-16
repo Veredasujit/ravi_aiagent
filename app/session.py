@@ -38,6 +38,13 @@ WHEN TO START TALKING (turn end)
   Whichever fires first: Deepgram's `speech_final`, its `UtteranceEnd`, or our
   own VAD silence timer. Any one of them alone has a failure mode; together
   they don't.
+
+BOOKING + WHATSAPP
+  The `ToolRunner` calls `session.on_booking_confirmed(...)` when the LLM
+  successfully books an appointment. We record that in `booking_registry`
+  keyed by `call_id`. The actual WhatsApp message is NOT sent from here —
+  it's enqueued by `/webhook` when Teler reports the call as `completed`,
+  because that's the only reliable "call is really over" signal.
 """
 
 from __future__ import annotations
@@ -49,7 +56,9 @@ import time
 from typing import Optional
 
 from . import config
+from . import flow_metadata
 from .audio import EndianDetector
+from .booking_state import BookingStatus, booking_registry
 from .llm import LLMClient, speakable
 from .logging_setup import CallLog, error, info, log, new_call_id, set_call_id, warn
 from .playout import Playout
@@ -60,28 +69,17 @@ from .tts import TTSAborted, TTSEngine
 from .vad import SileroVAD, VadEvent
 
 # How long a VAD-armed barge-in waits for Deepgram to confirm real words.
-# Measured: the first interim landed 1.93 s after Silero fired, so anything
-# near the old 1.2 s discards genuine interruptions as background noise.
 BARGE_ASR_WINDOW_S = 3.0
 
-# A pause is not the end of a turn. People stop mid-sentence to think, and on a
-# real call Ravi answered "first is," and "That the thing I face is" because our
-# VAD silence timer fired during those pauses. Deepgram's `speech_final` and
-# `UtteranceEnd` are the reliable end-of-turn signals; the VAD timer is only a
-# backstop for when they never arrive. So the backstop waits this long after the
-# LAST transcript activity before it will end a turn on its own.
+# Backstop: how long the VAD silence timer waits after the LAST transcript
+# activity before it will end a turn on its own.
 VAD_TURN_END_QUIET_S = 1.6
 
 # How long to wait for Teler's `start` frame before speaking anyway.
-# Measured across calls, `start` arrives anywhere from 1.9 s to 12.5 s after the
-# socket opens — and sometimes only AFTER we have already sent audio. So this is
-# a short courtesy pause, not a real gate: waiting longer just creates dead air
-# at the top of the call.
 STREAM_READY_TIMEOUT_S = 1.0
 
 # A final transcript that arrives *after* its turn already started stays in the
-# pending buffer. If nothing consumes it, it must not resurface twenty seconds
-# later glued to the next thing the caller says.
+# pending buffer. If nothing consumes it, it must not resurface later.
 PENDING_TEXT_MAX_AGE_S = 10.0
 
 
@@ -106,8 +104,13 @@ class CallSession:
 
         self.messages = initial_messages()
 
-        # Carrier byte order. Decided from the first second of inbound audio
-        # unless TELER_ENDIAN forces it.
+        # ─── Booking tracking ──────────────────────────────────────────
+        # Populated when we learn the caller's number (from the Teler
+        # `start` frame, or the caller states it verbally).
+        self.phone_number: str = ""
+        self.booking_record = None  # BookingRecord | None
+
+        # Carrier byte order.
         self.endian = EndianDetector(config.TELER_ENDIAN)
         self._endian_known = asyncio.Event()
         if self.endian.decided:
@@ -121,27 +124,28 @@ class CallSession:
         self._last_interim = ""
         self._turn_seq = 0
 
-        # Set when Teler confirms the media stream is live. Audio pushed before
-        # this is discarded by the carrier — it is the single biggest cause of
-        # a greeting that sounds cut off at the start.
+        # Set when Teler confirms the media stream is live.
         self._stream_ready = asyncio.Event()
 
         # barge-in state
         self._vad_barge_at: float = 0.0
         self._barge_armed = False
-        # When the current REPLY started coming out of the speaker. Playout's
-        # own timer restarts on every queued chunk, which silently re-armed the
-        # grace window mid-reply and made barge-in impossible.
         self._utterance_started_at: float = 0.0
 
         # housekeeping
         self._ended = asyncio.Event()
         self._last_user_audio_at = time.monotonic()
         self._last_activity_at = time.monotonic()
+        self._last_transcript_at = time.monotonic()
         self._reprompts = 0
         self._started_at = time.monotonic()
         self._watchdog: Optional[asyncio.Task] = None
         self._audio_frames_in = 0
+
+        # Attach this session to the tools runner so the LLM tool handlers
+        # can call back into the session (e.g. on_booking_confirmed).
+        if hasattr(self.tools, "bind_session"):
+            self.tools.bind_session(self)
 
     # ════════════════════════════════════════════════════════════════════════
     # lifecycle
@@ -159,25 +163,15 @@ class CallSession:
 
         self.playout.start()
 
-        # Start Deepgram in the background. The greeting needs TTS and nothing
-        # else — nobody has spoken yet — and waiting on the STT socket was
-        # adding ~1.8 s of dead air before the caller heard anything.
         stt_task = asyncio.create_task(self.stt.start(), name="stt-connect")
         try:
             await self.tts.prewarm()
         except Exception as exc:
             error("call", f"TTS prewarm failed: {exc}")
-        # Wait for Teler to confirm the stream is live. Accepting the
-        # WebSocket is NOT the same as the media path being open: on a measured
-        # call the `start` frame arrived 1.9 s later, and everything we sent in
-        # the meantime was dropped by the carrier.
-        await self._await_stream_ready()
 
+        await self._await_stream_ready()
         await asyncio.sleep(min(config.GREETING_DELAY_MS, 150) / 1000.0)
 
-        # Hold the greeting until we know the carrier's byte order, otherwise
-        # the first thing the caller hears could go out byte-swapped. Capped so
-        # a silent caller never blocks the greeting entirely.
         if not self._endian_known.is_set():
             try:
                 await asyncio.wait_for(
@@ -192,9 +186,6 @@ class CallSession:
         if stt_task.done() and stt_task.exception():
             error("call", f"STT connect failed: {stt_task.exception()}")
 
-        # Only now. Started any earlier, its silence timer fires while the
-        # greeting is still being prepared and the caller's first words from
-        # Ravi are "can you hear me?" instead of the greeting.
         self._last_activity_at = time.monotonic()
         self._watchdog = asyncio.create_task(self._watchdog_loop(), name="watchdog")
 
@@ -204,7 +195,6 @@ class CallSession:
             await self.shutdown()
 
     async def _await_stream_ready(self) -> None:
-        """Block until Teler's `start` frame (or the first inbound audio)."""
         if self._stream_ready.is_set():
             return
         t0 = time.monotonic()
@@ -234,6 +224,11 @@ class CallSession:
         self._ended.set()
         dur = round(time.monotonic() - self._started_at, 1)
         info("call", f"session end after {dur}s")
+
+        booking_snapshot = None
+        if self.booking_record is not None:
+            booking_snapshot = self.booking_record.to_dict()
+
         self.call_log.event(
             "call_end",
             seconds=dur,
@@ -241,7 +236,7 @@ class CallSession:
             audio_frames_in=self._audio_frames_in,
             vad=self.vad.stats(),
             big_endian=self.endian.big_endian,
-            booking=self.tools.booking,
+            booking=booking_snapshot or self.tools.booking,
             hangup_reason=self.tools.hangup_reason or None,
         )
 
@@ -258,6 +253,9 @@ class CallSession:
             return_exceptions=True,
         )
         self.call_log.close()
+
+        # IMPORTANT: do NOT enqueue WhatsApp here. The /webhook `completed`
+        # event is the only reliable signal that the call is actually over.
 
     # ════════════════════════════════════════════════════════════════════════
     # inbound audio from Teler
@@ -305,6 +303,77 @@ class CallSession:
         self.call_log.event("stream_start", teler_call_id=remote_id, detail=data)
         self._stream_ready.set()
 
+        # ─── ADOPT Teler's call_id so webhooks and sessions agree ──────
+        if remote_id and remote_id != self.call_id:
+            old_id = self.call_id
+            self.call_id = str(remote_id)
+            set_call_id(self.call_id)
+            info("call", f"adopted teler call_id {old_id!r} -> {self.call_id!r}")
+
+            # Re-key the booking registry entry under the new ID.
+            if self.booking_record is not None:
+                booking_registry.rekey(old_id, self.call_id)
+                self.booking_record.call_id = self.call_id
+
+        # ─── Extract phone number, in order of priority ────────────────
+        # 1. Try the start frame itself
+        candidate = (
+            data.get("from")
+            or data.get("caller")
+            or data.get("from_number")
+            or data.get("customer_number")
+            or data.get("to")
+            or data.get("to_number")
+        )
+
+        # 2. Fall back to /flow metadata (Teler sends from/to when we fetch flow)
+        if not candidate:
+            try:
+                meta = flow_metadata.pop(self.call_id)
+                if meta:
+                    direction = (meta.get("direction") or "inbound").lower()
+                    if direction == "outbound":
+                        candidate = meta.get("to_number") or meta.get("from_number")
+                    else:
+                        # inbound: caller is `from`
+                        candidate = meta.get("from_number") or meta.get("to_number")
+                    if candidate:
+                        info(
+                            "call",
+                            f"phone from /flow metadata: {candidate} "
+                            f"(direction={direction})",
+                        )
+            except Exception as exc:
+                warn("call", f"could not read /flow metadata: {exc}")
+
+        if candidate:
+            self.set_phone_number(str(candidate))
+            info("call", f"phone set to {self.phone_number!r}")
+        else:
+            warn("call", "no phone number available from start frame or /flow metadata")
+
+    def set_phone_number(self, number: str) -> None:
+        """
+        Called when we learn the caller's number — from the Teler `start`
+        frame, from the caller verbally, or from the outbound API.
+        Safe to call multiple times; later calls overwrite.
+        """
+        if not number:
+            return
+        digits = "".join(ch for ch in number if ch.isdigit())
+        if not digits:
+            return
+        if self.phone_number and self.phone_number == digits:
+            return
+        self.phone_number = digits
+        info("booking", f"phone number set: {digits}")
+
+        # Create the booking record lazily the first time we have a number.
+        if self.booking_record is None:
+            self.booking_record = booking_registry.create(self.call_id, digits)
+        else:
+            self.booking_record.phone_number = digits
+
     @staticmethod
     def _dig(msg: dict) -> str:
         data = msg.get("data") or {}
@@ -336,15 +405,10 @@ class CallSession:
         self._audio_frames_in += 1
         self._last_user_audio_at = time.monotonic()
 
-        # Inbound audio means the media path is open, whether or not we ever
-        # saw a `start` frame.
         if not self._stream_ready.is_set():
             info("call", "inbound audio before start frame — stream is live")
             self._stream_ready.set()
 
-        # Normalise the carrier's byte order before anything else touches the
-        # audio. Get this wrong and Deepgram transcribes nothing and the VAD
-        # sees noise, which is exactly what a byte-swapped stream looks like.
         was_decided = self.endian.decided
         pcm = self.endian.feed(pcm)
         if self.endian.decided and not was_decided:
@@ -360,8 +424,6 @@ class CallSession:
             )
             self._endian_known.set()
 
-        # Deepgram gets every byte, unconditionally — we never want a gap in
-        # the transcript, even while the bot is talking.
         await self.stt.send_audio(pcm)
 
         if not config.VAD_ENABLED:
@@ -383,9 +445,6 @@ class CallSession:
                 log("vad", "SPEECH_END")
                 self._barge_armed = False
                 if not self._bot_is_speaking() and self._pending_user_text:
-                    # Backstop only. If Deepgram is still producing transcripts
-                    # the caller is mid-sentence, not finished — answering here
-                    # is what makes Ravi talk over people.
                     quiet = time.monotonic() - self._last_transcript_at
                     if quiet >= VAD_TURN_END_QUIET_S:
                         await self._start_turn("vad_silence")
@@ -423,7 +482,6 @@ class CallSession:
             await self._do_barge_in("vad")
             return
 
-        # Arm and wait for Deepgram to confirm there were actual words.
         self._barge_armed = True
         self._vad_barge_at = time.monotonic()
         log("barge", f"armed by VAD, waiting up to {BARGE_ASR_WINDOW_S}s for ASR")
@@ -449,8 +507,6 @@ class CallSession:
         info("barge", f"INTERRUPTED by {source} ({dropped} bytes dropped)")
         self.call_log.event("barge_in", source=source, dropped_bytes=dropped)
 
-        # Whatever we had already queued was never heard in full; tell the model
-        # so it doesn't assume the caller heard the whole sentence.
         if self.messages and self.messages[-1].get("role") == "assistant":
             content = self.messages[-1].get("content") or ""
             if content:
@@ -472,7 +528,6 @@ class CallSession:
                 await self._do_barge_in("vad+asr")
             return
 
-        # Final transcript.
         if self._barge_armed and len(text.strip()) >= config.BARGE_IN_MIN_CHARS:
             await self._do_barge_in("vad+asr_final")
 
@@ -499,11 +554,6 @@ class CallSession:
             if not text:
                 return
 
-            # A final that landed while an earlier turn was already running
-            # stays buffered. If it was never consumed it is no longer what the
-            # caller is talking about — dropping it beats prefixing it to the
-            # next utterance, which is how "के लिए book कर सकते हो appointment?"
-            # ended up glued to a sentence spoken twenty seconds later.
             age = time.monotonic() - self._pending_since
             if age > PENDING_TEXT_MAX_AGE_S:
                 warn("turn", f"discarding {age:.0f}s-old pending text: {text!r}")
@@ -544,9 +594,6 @@ class CallSession:
         tool_calls: list[dict] = []
 
         try:
-            # Collect the whole reply first. Speaking it clause by clause shaved
-            # a few hundred ms off the first word but cost a Sarvam round trip
-            # per clause, and each of those is a gap the caller hears.
             async for kind, payload in self.llm.stream(self.messages, TOOLS_SCHEMA):
                 if kind == "token":
                     assistant_text += payload
@@ -555,7 +602,6 @@ class CallSession:
 
             reply = assistant_text.strip()
             if reply:
-                # ONE request, one continuous stream of audio.
                 ok = await self._speak_chunk(
                     reply, generation, seq, latency_mark=f"turn_{seq}"
                 )
@@ -582,7 +628,6 @@ class CallSession:
 
         self.playout.tts_active(False)
 
-        # Record what we said.
         if assistant_text.strip() or tool_calls:
             entry: dict = {"role": "assistant", "content": assistant_text.strip() or None}
             if tool_calls:
@@ -604,7 +649,7 @@ class CallSession:
                 warn("turn", f"#{seq} produced no speech")
             return
 
-        # Run the tools, then let the model narrate the result.
+        # ─── Run the tools, then let the model narrate the result. ─────
         for tc in tool_calls:
             result = await self.tools.run(tc["name"], tc["arguments"])
             self.messages.append(
@@ -622,6 +667,83 @@ class CallSession:
         await self._run_turn(seq, depth + 1)
 
     # ════════════════════════════════════════════════════════════════════════
+    # BOOKING HOOKS — called from ToolRunner / LLM tool handlers
+    # ════════════════════════════════════════════════════════════════════════
+    def _ensure_booking_record(self):
+        if self.booking_record is None:
+            self.booking_record = booking_registry.create(
+                self.call_id, self.phone_number
+            )
+        elif self.phone_number and not self.booking_record.phone_number:
+            self.booking_record.phone_number = self.phone_number
+        return self.booking_record
+
+    def on_booking_confirmed(
+        self,
+        *,
+        patient_name: Optional[str] = None,
+        doctor: Optional[str] = None,
+        department: Optional[str] = None,
+        appointment_time: Optional[str] = None,
+        booking_id: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        extra: Optional[dict] = None,
+    ) -> None:
+        """
+        Call this when the LLM/booking tool successfully confirms an
+        appointment. Safe to call more than once — the last call wins.
+        """
+        if phone_number:
+            self.set_phone_number(phone_number)
+        rec = self._ensure_booking_record()
+        booking_registry.mark_confirmed(
+            self.call_id,
+            patient_name=patient_name,
+            doctor=doctor,
+            department=department,
+            appointment_time=appointment_time,
+            booking_id=booking_id,
+            extra=extra,
+        )
+        self.tools.booking = {
+            "status": "confirmed",
+            "patient_name": patient_name,
+            "doctor": doctor,
+            "department": department,
+            "appointment_time": appointment_time,
+            "booking_id": booking_id,
+        }
+        info(
+            "booking",
+            f"CONFIRMED call_id={self.call_id} patient={patient_name} "
+            f"doctor={doctor} time={appointment_time} phone={self.phone_number}",
+        )
+        self.call_log.event(
+            "booking_confirmed",
+            patient_name=patient_name,
+            doctor=doctor,
+            department=department,
+            appointment_time=appointment_time,
+            booking_id=booking_id,
+            phone_number=self.phone_number,
+        )
+
+    def on_booking_cancelled(self, reason: str = "") -> None:
+        self._ensure_booking_record()
+        booking_registry.mark_cancelled(self.call_id)
+        self.tools.booking = {"status": "cancelled", "reason": reason}
+        info("booking", f"CANCELLED call_id={self.call_id} reason={reason}")
+        self.call_log.event("booking_cancelled", reason=reason)
+
+    def on_no_booking(self, reason: str = "") -> None:
+        """Call this when the caller clearly will NOT book on this call."""
+        self._ensure_booking_record()
+        booking_registry.mark_not_booked(self.call_id, reason=reason)
+        self.tools.booking = {"status": "not_booked", "reason": reason}
+        info("booking", f"NOT_BOOKED call_id={self.call_id} reason={reason}")
+        self.call_log.event("booking_not_booked", reason=reason)
+
+    # ════════════════════════════════════════════════════════════════════════
     # speaking
     # ════════════════════════════════════════════════════════════════════════
     async def _speak_chunk(
@@ -631,9 +753,6 @@ class CallSession:
         seq: int,
         latency_mark: Optional[str] = None,
     ) -> bool:
-        """
-        Synthesise a reply and queue it. Returns False if we were interrupted.
-        """
         text = speakable(chunk)
         if not text:
             return True
@@ -644,8 +763,6 @@ class CallSession:
                     log("tts", "generation changed mid-reply — dropping audio")
                     return False
                 if first:
-                    # The reply starts here. The barge-in grace window is
-                    # measured from this moment, once per reply.
                     self._utterance_started_at = time.monotonic()
                     if latency_mark:
                         self.call_log.latency(
@@ -653,8 +770,6 @@ class CallSession:
                         )
                     first = False
                 self.playout.push(pcm, generation)
-            # Synthesis is done: relay the tail instead of waiting for the
-            # buffer to fill.
             if generation == self.playout.generation:
                 await self.playout.flush()
             return True
@@ -665,10 +780,9 @@ class CallSession:
             raise
         except Exception as exc:
             error("tts", f"chunk failed: {exc}")
-            return True  # keep the conversation alive; skip this clause
+            return True
 
     async def _speak_text(self, text: str, tag: str = "say") -> None:
-        """Speak a fixed line (greeting, re-prompt, error) outside the LLM loop."""
         generation = self.playout.generation
         self.call_log.event("say", tag=tag, text=text)
         info("say", f"[{tag}] {text}")
@@ -691,7 +805,6 @@ class CallSession:
     async def _finish_and_hangup(self) -> None:
         info("call", f"hangup requested ({self.tools.hangup_reason})")
         self.call_log.event("hangup_requested", reason=self.tools.hangup_reason)
-        # Let the farewell finish playing before we drop the line.
         await self.playout.wait_drained(timeout=25.0)
         await asyncio.sleep(config.GOODBYE_HANGUP_DELAY_S)
         await self._close_socket()
@@ -715,6 +828,10 @@ class CallSession:
                 if now - self._started_at > config.MAX_CALL_SECONDS:
                     warn("call", "max call duration reached")
                     self.call_log.event("max_duration_reached")
+                    if self.booking_record and self.booking_record.status == BookingStatus.CONFIRMED:
+                        pass
+                    else:
+                        self.on_no_booking(reason="max_duration")
                     await self._speak_text(
                         "जी, समय की वजह से मुझे कॉल यहीं समाप्त करनी होगी। धन्यवाद।",
                         tag="timeout",
@@ -734,6 +851,10 @@ class CallSession:
                 if self._reprompts >= config.MAX_SILENCE_REPROMPTS:
                     info("call", "no response after re-prompts — ending")
                     self.call_log.event("no_response_hangup")
+                    if self.booking_record and self.booking_record.status == BookingStatus.CONFIRMED:
+                        pass
+                    else:
+                        self.on_no_booking(reason="no_response")
                     await self._speak_text(
                         "जी, शायद आवाज़ नहीं आ रही। कृपया दोबारा कॉल कीजिए। धन्यवाद।",
                         tag="no_response",
