@@ -17,10 +17,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import time
 from typing import Any, Optional
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -40,6 +42,26 @@ setup_logging()
 
 app = FastAPI(title="Ravi — Capital Hospital voice agent", version="1.0.0")
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CORS
+#
+# The website and this agent are different origins, so the browser sends an
+# OPTIONS preflight before any POST from the "Try a call" page. FastAPI answers
+# an unhandled OPTIONS with 405, the fetch fails before it reaches the handler,
+# and the page reports "all lines are busy" — which sends you debugging the
+# telephony instead of the browser.
+#
+# Teler is unaffected either way: it calls /flow and /webhook server-to-server
+# and never sends an Origin header, so this list only needs the website.
+# ═══════════════════════════════════════════════════════════════════════════
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    max_age=3600,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # startup checks — fail loudly at boot, not mid-call
@@ -57,9 +79,9 @@ async def _startup() -> None:
             else f"tts=sarvam:{config.SARVAM_MODEL}/{config.SARVAM_VOICE}"
             f"@{config.SARVAM_SAMPLE_RATE} "
         )
-        + 
-        f"llm={config.OPENAI_MODEL}",
+        + f"llm={config.OPENAI_MODEL}",
     )
+    info("boot", f"cors origins: {', '.join(config.CORS_ORIGINS) or '(none)'}")
     missing = config.missing_required()
     if missing:
         warn("boot", f"MISSING ENV: {', '.join(missing)} — calls will fail")
@@ -165,6 +187,10 @@ async def media_stream(ws: WebSocket) -> None:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # outbound calling
+#
+# This endpoint is reachable from a public button on the website, and every
+# request spends real money. The cooldown in the browser is advisory — a page
+# refresh clears it — so the limits that actually hold live here.
 # ═══════════════════════════════════════════════════════════════════════════
 class OutboundRequest(BaseModel):
     to_number: str
@@ -172,8 +198,49 @@ class OutboundRequest(BaseModel):
     record: Optional[bool] = None
 
 
+_recent_by_number: dict[str, float] = {}
+_recent_by_ip: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    # Behind nginx/Cloudflare the socket peer is the proxy, so prefer the
+    # forwarded chain's first entry.
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_limits(ip: str, number: str) -> None:
+    now = time.monotonic()
+
+    # Same number, back to back.
+    last = _recent_by_number.get(number)
+    if last is not None and now - last < config.OUTBOUND_NUMBER_COOLDOWN_S:
+        wait = int(config.OUTBOUND_NUMBER_COOLDOWN_S - (now - last))
+        warn("outbound", f"rate limited {number} ({wait}s left)")
+        raise HTTPException(429, f"This number was just called. Try again in {wait}s.")
+
+    # Same visitor, many numbers.
+    window = config.OUTBOUND_IP_WINDOW_S
+    hits = [t for t in _recent_by_ip.get(ip, []) if now - t < window]
+    if len(hits) >= config.OUTBOUND_IP_MAX:
+        warn("outbound", f"rate limited ip {ip} ({len(hits)} calls in {window}s)")
+        raise HTTPException(429, "Too many calls from this device. Try again later.")
+
+    _recent_by_number[number] = now
+    hits.append(now)
+    _recent_by_ip[ip] = hits
+
+    # Keep the tables from growing across a long-running process.
+    if len(_recent_by_number) > 5000:
+        for k, t in list(_recent_by_number.items()):
+            if now - t > config.OUTBOUND_NUMBER_COOLDOWN_S:
+                _recent_by_number.pop(k, None)
+
+
 @app.post("/call/outbound")
-async def call_outbound(req: OutboundRequest) -> JSONResponse:
+async def call_outbound(req: OutboundRequest, request: Request) -> JSONResponse:
     """
     Dial a number. Teler then fetches /flow and connects /media-stream, so the
     agent behaves identically to an inbound call.
@@ -183,13 +250,19 @@ async def call_outbound(req: OutboundRequest) -> JSONResponse:
     if not config.PUBLIC_HOST:
         raise HTTPException(500, "PUBLIC_HOST not configured")
 
+    to_number = req.to_number.strip()
+    if not to_number.startswith("+") or not to_number[1:].isdigit():
+        raise HTTPException(400, "to_number must be in E.164 form, e.g. +919876543210")
+
+    _check_limits(_client_ip(request), to_number)
+
     from_number = req.from_number or config.FREJUN_PHONE_NUMBER
     if not from_number:
         raise HTTPException(400, "no from_number and FREJUN_PHONE_NUMBER is unset")
 
     payload = {
         "from_number": from_number,
-        "to_number": req.to_number,
+        "to_number": to_number,
         "flow_url": f"https://{config.PUBLIC_HOST}/flow",
         "status_callback_url": f"https://{config.PUBLIC_HOST}/webhook",
         "record": config.TELER_RECORD if req.record is None else req.record,
@@ -201,7 +274,7 @@ async def call_outbound(req: OutboundRequest) -> JSONResponse:
         "X-Api-Key": config.TELER_API_KEY,
     }
 
-    info("outbound", f"dialling {req.to_number} from {from_number}")
+    info("outbound", f"dialling {to_number} from {from_number}")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(url, json=payload, headers=headers)
@@ -234,6 +307,7 @@ async def health() -> JSONResponse:
             "missing_env": config.missing_required(),
             "isLogging": config.isLogging,
             "public_host": config.PUBLIC_HOST or None,
+            "cors_origins": config.CORS_ORIGINS,
             "ws_url": f"wss://{config.PUBLIC_HOST}/media-stream"
             if config.PUBLIC_HOST
             else None,

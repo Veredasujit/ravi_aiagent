@@ -43,6 +43,10 @@ def _s(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
+def _list(name: str, default: str) -> list[str]:
+    return [x.strip() for x in _s(name, default).split(",") if x.strip()]
+
+
 # ─────────────────────────── logging ────────────────────────────────────────
 # The master switch you asked for. Everything downstream honours it.
 isLogging: bool = _b("IS_LOGGING", True)
@@ -61,6 +65,22 @@ FREJUN_PHONE_NUMBER = _s("FREJUN_PHONE_NUMBER")
 PUBLIC_HOST = _s("PUBLIC_HOST")  # e.g. agent.vedronix.com  (no scheme, no slash)
 FREJUN_WEBHOOK_SECRET = _s("FREJUN_WEBHOOK_SECRET")
 SKIP_SIGNATURE_VERIFICATION = _b("SKIP_SIGNATURE_VERIFICATION", False)
+
+# Browser origins allowed to call this agent. The "Try a call" page on the
+# website is a different origin, so without this the preflight fails and the
+# page can never reach /call/outbound. Teler itself is server-to-server and
+# sends no Origin header, so it is unaffected by this list.
+CORS_ORIGINS = _list(
+    "CORS_ORIGINS",
+    "https://vedronix.com,https://www.vedronix.com,http://localhost:5173",
+)
+
+# Guards on the public outbound endpoint. Every request spends real money, and
+# the cooldown in the browser is cleared by a refresh, so these are the limits
+# that actually hold.
+OUTBOUND_NUMBER_COOLDOWN_S = _f("OUTBOUND_NUMBER_COOLDOWN_S", 90.0)
+OUTBOUND_IP_WINDOW_S = _f("OUTBOUND_IP_WINDOW_S", 3600.0)
+OUTBOUND_IP_MAX = _i("OUTBOUND_IP_MAX", 5)
 
 # Teler streams L16 (signed 16-bit PCM) mono at 8 kHz, and expects the same back.
 TELER_SAMPLE_RATE = _i("TELER_SAMPLE_RATE", 8000)
@@ -248,7 +268,8 @@ class Doctor:
     name: str = _s("DOCTOR_NAME", "Dr. Vikash Sharma")
     speciality: str = _s("DOCTOR_SPECIALITY", "Physiotherapist at Neuranta")
     address: str = _s(
-        "CLINIC_ADDRESS", "Neuranta — Neuro & Pediatric Rehabilitation Centre in Gurgaon, Haryana"
+        "CLINIC_ADDRESS",
+        "Neuranta — Neuro & Pediatric Rehabilitation Centre in Gurgaon, Haryana",
     )
     morning: str = _s("OPD_MORNING", "सुबह नौ बजे से दोपहर दो बजे तक")
     evening: str = _s("OPD_EVENING", "शाम तीन बजे से शाम पाँच बजे तक")
